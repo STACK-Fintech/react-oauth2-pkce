@@ -20,6 +20,17 @@ export interface AuthServiceProps {
   refreshSlack?: number
 }
 
+export interface AuthClientConfig {
+  pkce: PKCECodePair
+  auth: AuthTokens | any
+  props: AuthServiceProps
+  preAuthUri: string
+}
+
+export interface AuthClientConfigMap {
+  [key: string] : AuthClientConfig
+}
+
 export interface AuthTokens {
   id_token: string
   access_token: string
@@ -27,6 +38,10 @@ export interface AuthTokens {
   expires_in: number
   expires_at?: number // calculated on login
   token_type: string
+}
+
+export interface AuthTokensMap {
+  [key: string]: AuthTokens
 }
 
 export interface JWTIDToken {
@@ -51,26 +66,32 @@ export class AuthService<TIDToken = JWTIDToken> {
   timeout?: number
 
   constructor(props: AuthServiceProps) {
+    if (!props || !props.clientId)
+      throw new Error("Configuration must include clientId!")
+   
+    const clientId = props.clientId
+    const clientConfig = this.getClientConfig(clientId)
+    clientConfig.props = props
+    this.setClientConfig(clientId, clientConfig)
     this.props = props
     const code = this.getCodeFromLocation(window.location)
     if (code !== null) {
-      this.fetchToken(code)
+      this.fetchToken(clientId, code)
         .then(() => {
-          this.restoreUri()
+          this.restoreUri(clientId)
         })
         .catch((e) => {
-          this.removeItem('pkce')
-          this.removeItem('auth')
+          this.clearClientConfig(clientId)
           this.removeCodeFromLocation()
           console.warn({ e })
         })
-    } else if (this.props.autoRefresh) {
-      this.startTimer()
+    } else if (clientConfig.props.autoRefresh) {
+      this.startTimer(clientId)
     }
   }
 
-  getUser(): {} {
-    const t = this.getAuthTokens()
+  getUser(clientId: string): {} {
+    const t = this.getAuthTokens(clientId)
     if (null === t) return {}
     const decoded = jwtDecode(t.id_token) as TIDToken
     return decoded
@@ -116,8 +137,28 @@ export class AuthService<TIDToken = JWTIDToken> {
     window.localStorage.removeItem(key)
   }
 
-  getPkce(): PKCECodePair {
-    const pkce = window.localStorage.getItem('pkce')
+  getAllClientConfigs() : AuthClientConfigMap {
+    return JSON.parse(window.localStorage.getItem('clients') || '{}')
+  }
+
+  clearClientConfig(clientId: string) {
+    const configs = this.getAllClientConfigs()
+    delete configs[clientId]
+    return window.localStorage.setItem('clients', JSON.stringify(configs))
+  }
+
+  getClientConfig(clientId: string): AuthClientConfig {
+    return this.getAllClientConfigs()[clientId] || {}
+  }
+
+  setClientConfig(clientId: string, config: AuthClientConfig) {
+    const configs = this.getAllClientConfigs()
+    configs[clientId] = config;
+    window.localStorage.setItem('clients', JSON.stringify(configs));
+  }
+
+  getPkce(clientId: string): PKCECodePair {
+    const pkce = window.localStorage.getItem(`${clientId}:pkce`)
     if (null === pkce) {
       throw new Error('PKCE pair not found in local storage')
     } else {
@@ -125,26 +166,65 @@ export class AuthService<TIDToken = JWTIDToken> {
     }
   }
 
-  setAuthTokens(auth: AuthTokens): void {
+  setPkce(clientId: string, pkce: PKCECodePair) {
+    const clientConfig = this.getClientConfig(clientId);
+    clientConfig.pkce = pkce;
+    this.setClientConfig(clientId, clientConfig);
+  }
+
+  clearAuthTokens(clientId: string) {
+    const config = this.getClientConfig(clientId);
+    config.auth = {}
+    this.setClientConfig(clientId, config)
+  }
+
+  setAuthTokens(clientId: string, auth: AuthTokens): void {
     const { refreshSlack = 5 } = this.props
     const now = new Date().getTime()
     auth.expires_at = now + (auth.expires_in + refreshSlack) * 1000
-    window.localStorage.setItem('auth', JSON.stringify(auth))
+    const clientConfig = this.getClientConfig(clientId);
+    clientConfig.auth = auth
+    this.setClientConfig(clientId, clientConfig);
   }
 
-  getAuthTokens(): AuthTokens {
-    return JSON.parse(window.localStorage.getItem('auth') || '{}')
+  getAuthTokens(clientId: string): AuthTokens {
+    return this.getClientConfig(clientId).auth
+  }
+  
+  getAllAuthTokens() : AuthTokensMap {
+    const clientConfigs = this.getAllClientConfigs()
+    const authTokens = {}
+    for (const c of Object.keys(clientConfigs)) {
+      authTokens[c] = clientConfigs[c]
+    }
+    return authTokens
   }
 
-  isPending(): boolean {
+  setPreAuthUri(clientId: string, preAuthUri: string) {
+    const config = this.getClientConfig(clientId)
+    config.preAuthUri = preAuthUri
+    this.setClientConfig(clientId, config)
+  }
+
+  getPreAuthUri(clientId: string) {
+    return this.getClientConfig(clientId).preAuthUri
+  }
+
+  clearPreAuthUri(clientId: string) {
+    const config = this.getClientConfig(clientId);
+    config.preAuthUri = ""
+    this.setClientConfig(clientId, config)
+  }
+
+  isPending(clientId: string): boolean {
     return (
-      window.localStorage.getItem('pkce') !== null &&
-      window.localStorage.getItem('auth') === null
+      window.localStorage.getItem(`${clientId}:pkce`) !== null &&
+      window.localStorage.getItem(`${clientId}:auth`) === null
     )
   }
 
-  isAuthenticated(): boolean {
-    return window.localStorage.getItem('auth') !== null
+  isAuthenticated(clientId: string): boolean {
+    return window.localStorage.getItem(`${clientId}:auth`) !== null
   }
 
   async logout(shouldEndSession: boolean = false): Promise<boolean> {
@@ -175,9 +255,9 @@ export class AuthService<TIDToken = JWTIDToken> {
 
 
     const pkce = createPKCECodes()
-    window.localStorage.setItem('pkce', JSON.stringify(pkce))
-    window.localStorage.setItem('preAuthUri', location.href)
-    window.localStorage.removeItem('auth')
+    this.setPkce(clientId, pkce)
+    this.setPreAuthUri(clientId, location.href)
+    this.clearAuthTokens(clientId)
     const codeChallenge = pkce.codeChallenge
 
     const query = {
@@ -197,71 +277,73 @@ export class AuthService<TIDToken = JWTIDToken> {
   }
 
   // this happens after a full page reload. Read the code from localstorage
-  async fetchToken(code: string, isRefresh = false): Promise<AuthTokens> {
-    const {
-      clientId,
-      clientSecret,
-      contentType,
-      provider,
-      tokenEndpoint,
-      redirectUri,
-      autoRefresh = true
-    } = this.props
-    const grantType = 'authorization_code'
+  async fetchToken(clientId: string, code: string, isRefresh = false): Promise<AuthTokens> {
 
-    let payload: TokenRequestBody = {
-      clientId,
-      ...(clientSecret ? { clientSecret } : {}),
-      redirectUri,
-      grantType
-    }
-    if (isRefresh) {
-      payload = {
-        ...payload,
-        grantType: 'refresh_token',
-        refresh_token: code
-      }
-    } else {
-      const pkce: PKCECodePair = this.getPkce()
-      const codeVerifier = pkce.codeVerifier
-      payload = {
-        ...payload,
-        code,
-        codeVerifier
-      }
-    }
+      const clientConfig = this.getClientConfig(clientId)
+      const {
+        clientSecret,
+        contentType,
+        provider,
+        tokenEndpoint,
+        redirectUri,
+        autoRefresh = true
+      } = clientConfig.props
+    
+      const grantType = 'authorization_code'
 
-    const response = await fetch(`${tokenEndpoint || `${provider}/token`}`, {
-      headers: {
-        'Content-Type': contentType || 'application/x-www-form-urlencoded'
-      },
-      method: 'POST',
-      body: toUrlEncoded(payload)
-    })
-    this.removeItem('pkce')
-    let json = await response.json()
-    if (isRefresh && !json.refresh_token) {
-      json.refresh_token = payload.refresh_token
-    }
-    this.setAuthTokens(json as AuthTokens)
-    if (autoRefresh) {
-      this.startTimer()
-    }
-    return this.getAuthTokens()
+      let payload: TokenRequestBody = {
+        clientId,
+        ...(clientSecret ? { clientSecret } : {}),
+        redirectUri,
+        grantType
+      }
+      if (isRefresh) {
+        payload = {
+          ...payload,
+          grantType: 'refresh_token',
+          refresh_token: code
+        }
+      } else {
+        const pkce: PKCECodePair = this.getPkce(clientId)
+        const codeVerifier = pkce.codeVerifier
+        payload = {
+          ...payload,
+          code,
+          codeVerifier
+        }
+      }
+
+      const response = await fetch(`${tokenEndpoint || `${provider}/token`}`, {
+        headers: {
+          'Content-Type': contentType || 'application/x-www-form-urlencoded'
+        },
+        method: 'POST',
+        body: toUrlEncoded(payload)
+      })
+      this.removeItem('pkce')
+      let json = await response.json()
+      if (isRefresh && !json.refresh_token) {
+        json.refresh_token = payload.refresh_token
+      }
+      this.setAuthTokens(clientId, json as AuthTokens)
+      if (autoRefresh) {
+        this.startTimer(clientId)
+      }
+    return this.getAuthTokens(clientId)
   }
 
-  armRefreshTimer(refreshToken: string, timeoutDuration: number): void {
+  armRefreshTimer(clientId: string, refreshToken: string, timeoutDuration: number): void {
     if (this.timeout) {
       clearTimeout(this.timeout)
     }
     this.timeout = window.setTimeout(() => {
-      this.fetchToken(refreshToken, true)
+      this.fetchToken(clientId, refreshToken, true)
         .then(({ refresh_token: newRefreshToken, expires_at: expiresAt }) => {
           if (!expiresAt) return
           const now = new Date().getTime()
           const timeout = expiresAt - now
           if (timeout > 0) {
-            this.armRefreshTimer(newRefreshToken, timeout)
+            this.armRefreshTimer(clientId, newRefreshToken, timeout)
           } else {
             this.removeItem('auth')
             this.removeCodeFromLocation()
@@ -275,8 +357,8 @@ export class AuthService<TIDToken = JWTIDToken> {
     }, timeoutDuration)
   }
 
-  startTimer(): void {
-    const authTokens = this.getAuthTokens()
+  startTimer(clientId: string): void {
+    const authTokens = this.getAuthTokens(clientId)
     if (!authTokens) {
       return
     }
@@ -287,16 +369,15 @@ export class AuthService<TIDToken = JWTIDToken> {
     const now = new Date().getTime()
     const timeout = expiresAt - now
     if (timeout > 0) {
-      this.armRefreshTimer(refreshToken, timeout)
+      this.armRefreshTimer(clientId, refreshToken, timeout)
     } else {
-      this.removeItem('auth')
       this.removeCodeFromLocation()
     }
   }
 
-  restoreUri(): void {
-    const uri = window.localStorage.getItem('preAuthUri')
-    window.localStorage.removeItem('preAuthUri')
+  restoreUri(clientId: string): void {
+    const uri = this.getPreAuthUri(clientId)
+    this.clearPreAuthUri(clientId)
     console.log({ uri })
     if (uri !== null) {
       window.location.replace(uri)
